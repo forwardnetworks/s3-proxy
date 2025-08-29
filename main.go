@@ -1,19 +1,22 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -23,147 +26,164 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 )
 
+type AWSCredentials struct {
+	AccessKeyId     string `json:"AccessKeyId"`
+	SecretAccessKey string `json:"SecretAccessKey"`
+	Token           string `json:"Token"`
+	Expiration      string `json:"Expiration"`
+}
+
 var (
-	defaultRegion string
-	baseCfg       aws.Config
-	clientCache   = make(map[string]*s3.Client)
-	cacheLock     sync.Mutex
+	credsMutex    sync.RWMutex
+	currentCreds  AWSCredentials
+	debug         = os.Getenv("DEBUG") == "1"
+	ttlSeconds    = getEnvInt("TOKEN_TTL_SECONDS", 21600)
+	region        = getEnv("AWS_REGION", "us-west-2")
+	authAccessKey = os.Getenv("ACCESS_KEY_ID")
+	authSecretKey = os.Getenv("SECRET_ACCESS_KEY")
 	allowedCIDRs  []*net.IPNet
 )
 
-func loadTLSConfig() (*tls.Config, error) {
-	certPath := os.Getenv("TLS_CERT_PATH")
-	keyPath := os.Getenv("TLS_KEY_PATH")
+func getEnv(key, fallback string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		return fallback
+	}
+	return val
+}
 
-	if certPath != "" && keyPath != "" {
-		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+func getEnvInt(key string, fallback int) int {
+	val := os.Getenv(key)
+	if parsed, err := strconv.Atoi(val); err == nil {
+		return parsed
+	}
+	return fallback
+}
+
+func logDebug(format string, a ...interface{}) {
+	if debug {
+		log.Printf(format, a...)
+	}
+}
+
+func fetchIMDSToken(ttl int) (string, error) {
+	req, _ := http.NewRequest("PUT", "http://169.254.169.254/latest/api/token", nil)
+	req.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", strconv.Itoa(ttl))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	token, _ := io.ReadAll(resp.Body)
+	return string(token), nil
+}
+
+func fetchRole(token string) (string, error) {
+	req, _ := http.NewRequest("GET", "http://169.254.169.254/latest/meta-data/iam/security-credentials/", nil)
+	req.Header.Set("X-aws-ec2-metadata-token", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	role, _ := io.ReadAll(resp.Body)
+	return string(role), nil
+}
+
+func fetchCreds(token, role string) (AWSCredentials, error) {
+	req, _ := http.NewRequest("GET", "http://169.254.169.254/latest/meta-data/iam/security-credentials/"+role, nil)
+	req.Header.Set("X-aws-ec2-metadata-token", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return AWSCredentials{}, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var creds AWSCredentials
+	json.Unmarshal(body, &creds)
+	return creds, nil
+}
+
+func refreshLoop() {
+	for {
+		logDebug("Refreshing credentials from IMDS")
+		token, err := fetchIMDSToken(ttlSeconds)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load TLS cert and key: %v", err)
+			log.Printf("Token error: %v", err)
+			time.Sleep(1 * time.Minute)
+			continue
 		}
-		return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
-	}
-
-	log.Printf("[WARN] TLS_CERT_PATH or TLS_KEY_PATH not set, generating self-signed certificate")
-
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate private key: %v", err)
-	}
-
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate serial number: %v", err)
-	}
-
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			Organization: []string{"Self-Signed"},
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create certificate: %v", err)
-	}
-
-	certPem := &bytes.Buffer{}
-	keyPem := &bytes.Buffer{}
-
-	if err := pem.Encode(certPem, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
-		return nil, fmt.Errorf("failed to encode cert pem: %v", err)
-	}
-	privBytes := x509.MarshalPKCS1PrivateKey(priv)
-	if err := pem.Encode(keyPem, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: privBytes}); err != nil {
-		return nil, fmt.Errorf("failed to encode key pem: %v", err)
-	}
-
-	cert, err := tls.X509KeyPair(certPem.Bytes(), keyPem.Bytes())
-	if err != nil {
-		return nil, fmt.Errorf("failed to load key pair: %v", err)
-	}
-
-	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
-}
-
-func startServer(port string) {
-	tlsConfig, err := loadTLSConfig()
-	if err != nil {
-		log.Fatalf("Failed to load TLS config: %v", err)
-	}
-
-	server := &http.Server{
-		Addr:      ":" + port,
-		Handler:   http.DefaultServeMux,
-		TLSConfig: tlsConfig,
-	}
-
-	if debugEnabled {
-		log.Printf("S3 proxy server running on :%s with TLS\n", port)
-	}
-	log.Fatal(server.ListenAndServeTLS("", ""))
-}
-
-var debugEnabled bool
-
-func main() {
-	debugEnabled = os.Getenv("DEBUG") == "1"
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		log.Fatalf("PORT environment variable must be set")
-	}
-
-	if strings.ToLower(os.Getenv("DEBUG")) == "true" {
-		log.SetFlags(log.LstdFlags | log.Lshortfile)
-	}
-
-	if debugEnabled {
-		log.Printf("Default AWS region: %s", defaultRegion)
-	}
-
-	defaultRegion = os.Getenv("AWS_REGION")
-
-	if cidrList := os.Getenv("ALLOWED_CIDRS"); cidrList != "" {
-		for _, cidr := range strings.Split(cidrList, ",") {
-			_, network, err := net.ParseCIDR(strings.TrimSpace(cidr))
-			if err != nil {
-				log.Fatalf("Invalid CIDR in ALLOWED_CIDRS: %v", err)
-			}
-			allowedCIDRs = append(allowedCIDRs, network)
+		role, err := fetchRole(token)
+		if err != nil {
+			log.Printf("Role error: %v", err)
+			time.Sleep(1 * time.Minute)
+			continue
 		}
+		c, err := fetchCreds(token, role)
+		if err != nil {
+			log.Printf("Creds error: %v", err)
+			time.Sleep(1 * time.Minute)
+			continue
+		}
+		credsMutex.Lock()
+		currentCreds = c
+		credsMutex.Unlock()
+		exp, _ := time.Parse(time.RFC3339, c.Expiration)
+		sleep := time.Until(exp) - 5*time.Minute
+		if sleep < 1*time.Minute {
+			sleep = 1 * time.Minute
+		}
+		logDebug("Refreshed. Sleeping %v", sleep)
+		time.Sleep(sleep)
 	}
-
-	var err error
-	baseCfg, err = config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		log.Fatalf("Unable to load base AWS config: %v", err)
-	}
-
-	http.HandleFunc("/", s3Handler)
-	startServer(port)
 }
 
-func s3Handler(w http.ResponseWriter, r *http.Request) {
-	if len(allowedCIDRs) > 0 {
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			logDebug("Authorization header present — skipping custom auth")
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		key := r.Header.Get("access_key")
+		secret := r.Header.Get("secret_access_key")
+
+		logDebug("Incoming headers: %+v", r.Header)
+		logDebug("Incoming query: %s", r.URL.RawQuery)
+
+		if key == "" || secret == "" {
+			key = r.URL.Query().Get("access_key")
+			secret = r.URL.Query().Get("secret_access_key")
+		}
+		if key != authAccessKey || secret != authSecretKey {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func ipFilterMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(allowedCIDRs) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
 		ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
-			log.Printf("Failed to parse RemoteAddr: %v", err)
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 		allowed := false
 		for _, cidr := range allowedCIDRs {
 			if cidr.Contains(ip) {
@@ -172,313 +192,144 @@ func s3Handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !allowed {
-			log.Printf("Request from %s denied by CIDR policy", ip)
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
-	}
-
-	if debugEnabled {
-		log.Printf("[REQUEST] %s %s", r.Method, r.URL.Path)
-		log.Printf("[HEADERS] %+v", r.Header)
-	}
-
-	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)
-	if len(parts) < 1 || parts[0] == "" {
-		http.Error(w, "Bucket not specified", http.StatusBadRequest)
-		return
-	}
-	bucket := parts[0]
-
-	switch r.Method {
-	case "GET":
-		if len(parts) == 1 || parts[1] == "" {
-			handleListBucket(w, bucket)
-		} else {
-			handleDownload(w, bucket, parts[1])
-		}
-	case "PUT":
-		if len(parts) < 2 {
-			http.Error(w, "Key not specified", http.StatusBadRequest)
-			return
-		}
-		handleUpload(w, r, bucket, parts[1])
-	case "DELETE":
-		if len(parts) < 2 {
-			http.Error(w, "Key not specified", http.StatusBadRequest)
-			return
-		}
-		handleDelete(w, bucket, parts[1])
-	case "HEAD":
-		if len(parts) < 2 || parts[1] == "" {
-			http.Error(w, "Object key must be specified", http.StatusBadRequest)
-			return
-		}
-		handleHead(w, r, bucket, parts[1])
-	default:
-		http.Error(w, "Unsupported method", http.StatusMethodNotAllowed)
-	}
-}
-
-func getS3ClientForBucket(bucket string) (*s3.Client, error) {
-	cacheLock.Lock()
-	defer cacheLock.Unlock()
-
-	if client, ok := clientCache[bucket]; ok {
-		return client, nil
-	}
-
-	region := defaultRegion
-	if region == "" {
-		if debugEnabled {
-			log.Printf("[INFO] Resolving region for bucket: %s", bucket)
-		}
-		r, err := manager.GetBucketRegion(context.TODO(), s3.NewFromConfig(baseCfg), bucket)
-		if err != nil {
-			return nil, fmt.Errorf("could not determine region for bucket %s: %v", bucket, err)
-		}
-		region = r
-		if debugEnabled {
-			log.Printf("[INFO] Detected region %s for bucket %s", region, bucket)
-		}
-	}
-
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
-	if err != nil {
-		return nil, fmt.Errorf("failed to load config for region %s: %v", region, err)
-	}
-
-	client := s3.NewFromConfig(cfg)
-	clientCache[bucket] = client
-	return client, nil
-}
-
-func handleListBucket(w http.ResponseWriter, bucket string) {
-	if debugEnabled {
-		log.Printf("[LIST] Bucket: %s", bucket)
-	}
-	client, err := getS3ClientForBucket(bucket)
-	if err != nil {
-		if debugEnabled {
-			log.Printf("[ERROR] %v", err)
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	resp, err := client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
+		next.ServeHTTP(w, r)
 	})
-	if err != nil {
-		if debugEnabled {
-			log.Printf("[ERROR] list bucket: %v", err)
-		}
-		http.Error(w, "Failed to list bucket: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/xml")
-	fmt.Fprintln(w, `<?xml version="1.0" encoding="UTF-8"?>`)
-	fmt.Fprintln(w, `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
-	for _, obj := range resp.Contents {
-		fmt.Fprintf(w, "  <Contents><Key>%s</Key></Contents>\n", *obj.Key)
-	}
-	fmt.Fprintln(w, `</ListBucketResult>`)
 }
 
-func handleDownload(w http.ResponseWriter, bucket, key string) {
-	if key == "" {
-		if debugEnabled {
-			log.Printf("[ERROR] key missing for download: bucket=%s", bucket)
+func s3ProxyHandler(w http.ResponseWriter, r *http.Request) {
+	credsMutex.RLock()
+	creds := currentCreds
+	credsMutex.RUnlock()
+
+	buf := &bytes.Buffer{}
+	if r.Body != nil {
+		io.Copy(buf, r.Body)
+		r.Body.Close()
+	}
+	r.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
+
+	endpoint := fmt.Sprintf("https://s3.%s.amazonaws.com", region)
+	url := endpoint + r.URL.Path + "?" + r.URL.RawQuery
+
+	req, _ := http.NewRequest(r.Method, url, bytes.NewReader(buf.Bytes()))
+	req.Header = r.Header.Clone()
+
+	// Clear potentially conflicting headers
+	req.Header.Del("Authorization")
+	req.Header.Del("X-Amz-Date")
+	req.Header.Del("X-Amz-Security-Token")
+	req.Header.Del("X-Amz-Content-Sha256")
+	req.Header.Del("X-Amz-User-Agent")
+	for h := range req.Header {
+		if strings.HasPrefix(strings.ToLower(h), "x-amz-") {
+			req.Header.Del(h)
 		}
-		http.Error(w, "Object key must be specified", http.StatusBadRequest)
-		return
 	}
-	if debugEnabled {
-		log.Printf("[DOWNLOAD] Bucket: %s, Key: %s", bucket, key)
+	logDebug("Cleared original AWS headers — re-signing request")
+
+	signer := v4.NewSigner()
+	awsCreds := aws.Credentials{
+		AccessKeyID:     creds.AccessKeyId,
+		SecretAccessKey: creds.SecretAccessKey,
+		SessionToken:    creds.Token,
+		Source:          "shim",
 	}
-	client, err := getS3ClientForBucket(bucket)
+	sum := sha256.Sum256(buf.Bytes())
+	payloadHash := hex.EncodeToString(sum[:])
+	req.Header.Set("x-amz-content-sha256", payloadHash)
+	err := signer.SignHTTP(context.Background(), awsCreds, req, payloadHash, "s3", region, time.Now())
 	if err != nil {
-		if debugEnabled {
-			log.Printf("[ERROR] %v", err)
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Signing error: "+err.Error(), 500)
 		return
 	}
 
-	resp, err := client.GetObject(context.TODO(), &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		if debugEnabled {
-			log.Printf("[ERROR] download: %v", err)
-		}
-		http.Error(w, "Failed to download object: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Proxy error: "+err.Error(), 502)
 		return
 	}
 	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
 
-func handleUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if key == "" {
-		if debugEnabled {
-			log.Printf("[ERROR] key missing for upload: bucket=%s", bucket)
-		}
-		http.Error(w, "Object key must be specified", http.StatusMethodNotAllowed)
-		return
-	}
-	if debugEnabled {
-		log.Printf("[UPLOAD] Bucket: %s, Key: %s", bucket, key)
-	}
-	client, err := getS3ClientForBucket(bucket)
+func generateSelfSigned() (tls.Certificate, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		if debugEnabled {
-			log.Printf("[ERROR] %v", err)
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return tls.Certificate{}, err
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(mrand.Int63()),
+		Subject: pkix.Name{
+			CommonName: "localhost",
+		},
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:  x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{
+			x509.ExtKeyUsageServerAuth,
+		},
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes})
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" || authAccessKey == "" || authSecretKey == "" {
+		log.Fatal("Missing required env: PORT, ACCESS_KEY_ID, SECRET_ACCESS_KEY")
 	}
 
-	var body io.ReadCloser
-	if r.Header.Get("X-Amz-Content-Sha256") == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
-		if debugEnabled {
-			log.Printf("[UPLOAD] Detected streaming AWS chunked payload")
-		}
-
-		var fullPayload bytes.Buffer
-		reader := bufio.NewReader(r.Body)
-
-		for {
-			// Read chunk size line
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if debugEnabled {
-					log.Printf("[ERROR] reading chunk header: %v", err)
-				}
-				http.Error(w, "Invalid chunked payload", http.StatusBadRequest)
-				return
-			}
-
-			line = strings.TrimSpace(line)
-			if line == "" {
+	// Parse ALLOWED_SOURCE_CIDRS env var
+	cidrs := os.Getenv("ALLOWED_SOURCE_CIDRS")
+	if cidrs != "" {
+		for _, cidrStr := range strings.Split(cidrs, ",") {
+			cidrStr = strings.TrimSpace(cidrStr)
+			if cidrStr == "" {
 				continue
 			}
-
-			// Parse chunk size
-			chunkSizeStr := strings.Split(line, ";")[0]
-			chunkSize, err := strconv.ParseInt(chunkSizeStr, 16, 64)
+			_, cidr, err := net.ParseCIDR(cidrStr)
 			if err != nil {
-				if debugEnabled {
-					log.Printf("[ERROR] invalid chunk size: %s", chunkSizeStr)
-				}
-				http.Error(w, "Invalid chunk size", http.StatusBadRequest)
-				return
+				log.Fatalf("Invalid CIDR in ALLOWED_SOURCE_CIDRS: %s", cidrStr)
 			}
-			if chunkSize == 0 {
-				break
-			}
-
-			// Read chunk data
-			chunk := make([]byte, chunkSize)
-			_, err = io.ReadFull(reader, chunk)
-			if err != nil {
-				if debugEnabled {
-					log.Printf("[ERROR] reading chunk data: %v", err)
-				}
-				http.Error(w, "Failed to read chunk", http.StatusBadRequest)
-				return
-			}
-
-			fullPayload.Write(chunk)
-
-			// Read trailing \r\n
-			_, err = reader.ReadString('\n')
-			if err != nil {
-				if debugEnabled {
-					log.Printf("[ERROR] reading chunk trailer: %v", err)
-				}
-				http.Error(w, "Invalid chunk trailer", http.StatusBadRequest)
-				return
-			}
+			allowedCIDRs = append(allowedCIDRs, cidr)
 		}
-
-		body = io.NopCloser(bytes.NewReader(fullPayload.Bytes()))
-	} else {
-		body = r.Body
 	}
 
-	input := &s3.PutObjectInput{
-		Bucket: &bucket,
-		Key:    &key,
-		Body:   body,
-	}
+	go refreshLoop()
 
-	_, err = client.PutObject(context.TODO(), input)
+	cert, err := generateSelfSigned()
 	if err != nil {
-		if debugEnabled {
-			log.Printf("[ERROR] upload: %v", err)
-		}
-		http.Error(w, "Failed to upload: "+err.Error(), http.StatusInternalServerError)
-		return
+		log.Fatalf("TLS cert generation failed: %v", err)
 	}
 
-	fmt.Fprintf(w, "Uploaded %s/%s\n", bucket, key)
-}
+	mux := http.NewServeMux()
+	mux.Handle("/", ipFilterMiddleware(authMiddleware(http.HandlerFunc(s3ProxyHandler))))
 
-func handleDelete(w http.ResponseWriter, bucket, key string) {
-	if debugEnabled {
-		log.Printf("[DELETE] Bucket: %s, Key: %s", bucket, key)
-	}
-	client, err := getS3ClientForBucket(bucket)
-	if err != nil {
-		if debugEnabled {
-			log.Printf("[ERROR] %v", err)
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	srv := &http.Server{
+		Addr:      ":" + port,
+		Handler:   mux,
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
 	}
 
-	_, err = client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		if debugEnabled {
-			log.Printf("[ERROR] delete: %v", err)
-		}
-		http.Error(w, "Failed to delete: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	fmt.Fprintf(w, "Deleted %s/%s\n", bucket, key)
-}
-
-func handleHead(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if debugEnabled {
-		log.Printf("[HEAD] Bucket: %s, Key: %s", bucket, key)
-	}
-	client, err := getS3ClientForBucket(bucket)
-	if err != nil {
-		if debugEnabled {
-			log.Printf("[ERROR] %v", err)
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	_, err = client.HeadObject(context.TODO(), &s3.HeadObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		if debugEnabled {
-			log.Printf("[ERROR] head object: %v", err)
-		}
-		http.Error(w, "Failed to HEAD object: "+err.Error(), http.StatusNotFound)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
+	log.Printf("Listening on https://localhost:%s", port)
+	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
